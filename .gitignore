@@ -1,0 +1,14 @@
+# 编译产物
+/target
+# 日志（本地运行日志默认写入 %LOCALAPPDATA%\DeskKeeper\logs）
+*.log
+
+# 本地用户态数据（正常位于 %LOCALAPPDATA%\DeskKeeper，此处防止误把副本放进仓库）
+/config.toml
+/clipboard.db
+/clipboard.db-*
+/logs/
+/thumbs/
+/boxes/
+/docs/
+/.screenshots/
