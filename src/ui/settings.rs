@@ -343,6 +343,46 @@ pub(crate) fn show(
                 hint(ui, pal, "清空全部历史（含置顶项），不可恢复。");
             });
 
+            section(ui, pal, "待办提醒");
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut cfg.reminder.enabled, "启用到期提醒");
+                ui.add_space(12.0);
+                ui.checkbox(&mut cfg.reminder.balloon, "用托盘气泡提醒");
+            });
+            ui.horizontal(|ui| {
+                ui.label("每日提醒时刻");
+                let mut hour = (cfg.reminder.daily_minute / 60).min(23);
+                let mut minute = (cfg.reminder.daily_minute % 60).min(59);
+                let hour_changed = ui
+                    .add(egui::DragValue::new(&mut hour).range(0..=23).suffix(" 时"))
+                    .changed();
+                let minute_changed = ui
+                    .add(egui::DragValue::new(&mut minute).range(0..=59).suffix(" 分"))
+                    .changed();
+                if hour_changed || minute_changed {
+                    cfg.reminder.daily_minute = hour * 60 + minute;
+                }
+                ui.add_space(14.0);
+                ui.label("提前提醒");
+                ui.add(
+                    egui::DragValue::new(&mut cfg.reminder.lead_min)
+                        .range(0..=1440)
+                        .suffix(" 分钟"),
+                );
+                ui.add_space(14.0);
+                ui.label("稍后提醒");
+                ui.add(
+                    egui::DragValue::new(&mut cfg.reminder.snooze_min)
+                        .range(1..=240)
+                        .suffix(" 分钟"),
+                );
+            });
+            hint(
+                ui,
+                pal,
+                "只设日期的待办在「每日提醒时刻」提醒；「提前提醒」是新建到期时间的默认提前量。",
+            );
+
             section(ui, pal, "通用");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut cfg.general.autostart, "开机自动启动");

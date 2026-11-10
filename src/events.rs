@@ -142,6 +142,10 @@ pub enum BgEvent {
         checked: usize,
         elapsed_ms: f64,
     },
+    /// 调度器扫描到的到期提醒（UI 线程负责展示、去重与推进周期）。
+    RemindersDue(Vec<crate::reminder::scheduler::DueItem>),
+    /// 用户点击了到期气泡：打开对应的待办盒。
+    ReminderActivated(String),
 }
 
 /// 可在任意线程克隆使用的事件发送器；发送后主动唤醒 egui。

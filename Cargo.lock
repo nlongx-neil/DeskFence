@@ -3,6 +3,24 @@
 version = 4
 
 [[package]]
+name = "DeskFence"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eframe",
+ "egui",
+ "encoding_rs",
+ "image",
+ "log",
+ "rusqlite",
+ "serde",
+ "sha2",
+ "toml",
+ "windows",
+ "zip",
+]
+
+[[package]]
 name = "accesskit"
 version = "0.25.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -393,24 +411,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
-]
-
-[[package]]
-name = "deskkeeper"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "eframe",
- "egui",
- "encoding_rs",
- "image",
- "log",
- "rusqlite",
- "serde",
- "sha2",
- "toml",
- "windows",
- "zip",
 ]
 
 [[package]]

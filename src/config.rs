@@ -244,6 +244,63 @@ impl Default for DesktopConfig {
     }
 }
 
+/// 待办的重复规则。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatRule {
+    /// 只提醒一次
+    #[default]
+    Once,
+    /// 每天同一本地时刻
+    Daily,
+    /// 工作日（周一至周五）同一本地时刻
+    Weekdays,
+    /// 固定间隔（每 [`TodoItem::interval_minutes`] 分钟）
+    Interval,
+}
+
+impl RepeatRule {
+    pub const ALL: [RepeatRule; 4] = [
+        RepeatRule::Once,
+        RepeatRule::Daily,
+        RepeatRule::Weekdays,
+        RepeatRule::Interval,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RepeatRule::Once => "一次",
+            RepeatRule::Daily => "每天",
+            RepeatRule::Weekdays => "工作日",
+            RepeatRule::Interval => "周期",
+        }
+    }
+
+    pub fn is_repeating(self) -> bool {
+        !matches!(self, RepeatRule::Once)
+    }
+}
+
+/// 固定间隔的相位基准（仅在 `repeat = interval` 时生效）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IntervalBase {
+    /// 按到期时刻推进：固定相位，不随完成时间漂移。
+    #[default]
+    DueTime,
+    /// 按完成时刻推进：每次完成后再起算下一个周期。
+    CompletionTime,
+}
+
+/// 固定间隔的最小粒度（分钟）：低于该值视为噪音，写回时收敛到该值。
+pub const MIN_INTERVAL_MIN: u32 = 5;
+
+/// 固定间隔的预设项（分钟）：30 分钟 / 1 小时 / 2 小时 / 4 小时。
+pub const INTERVAL_PRESETS_MIN: [u32; 4] = [30, 60, 120, 240];
+
+/// 「只设日期」时的默认提醒时刻（本地分钟，09:00）。
+pub const DEFAULT_DAILY_REMINDER_MINUTE: u16 = 9 * 60;
+
 /// 待办项（保存在配置中，不落盘为文件）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -251,6 +308,33 @@ pub struct TodoItem {
     pub id: String,
     pub text: String,
     pub done: bool,
+    /// 当前有效到期点的 UTC epoch 秒；`None` = 无到期时间。
+    pub due_at: Option<i64>,
+    /// 只设日期：`due_at` 存当天 00:00 本地时间，提醒时刻取全局「每日提醒时刻」。
+    pub all_day: bool,
+    /// 本地日期（自 1970-01-01 起的天数），日历类重复的锚点。
+    pub local_date: Option<i32>,
+    /// 本地 0-1439 分钟，日历类重复的锚点。
+    pub local_minute: u16,
+    /// 重复规则。
+    pub repeat: RepeatRule,
+    /// 固定间隔的周期长度（分钟，下限 [`MIN_INTERVAL_MIN`]；0 表示未设置）。
+    pub interval_min: u32,
+    /// 固定间隔的相位基准。
+    pub interval_base: IntervalBase,
+    /// 提前提醒的分钟数。
+    pub lead_min: u16,
+    /// 稍后提醒的抑制窗口截止（UTC epoch 秒），不改 `due_at`。
+    pub snooze_until: Option<i64>,
+    /// 已提醒到的到期点（UTC epoch 秒），用于幂等去重。
+    pub last_fired: Option<i64>,
+}
+
+impl TodoItem {
+    /// 实际生效的周期长度（分钟）；未设置或低于下限时收敛到下限。
+    pub fn interval_minutes(&self) -> u32 {
+        self.interval_min.max(MIN_INTERVAL_MIN)
+    }
 }
 
 /// 待办盒排序方式。
@@ -477,6 +561,34 @@ impl Default for GeneralConfig {
     }
 }
 
+/// 待办到期提醒的全局设置。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReminderConfig {
+    /// 提醒总开关（关闭后不扫描、不弹气泡，盒内文案仍显示）。
+    pub enabled: bool,
+    /// 「只设日期」的提醒时刻（本地分钟，默认 09:00）。
+    pub daily_minute: u16,
+    /// 新建到期时间时的默认提前量（分钟）。
+    pub lead_min: u16,
+    /// 稍后提醒的默认时长（分钟）。
+    pub snooze_min: u16,
+    /// 是否用系统托盘气泡提醒。
+    pub balloon: bool,
+}
+
+impl Default for ReminderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            daily_minute: DEFAULT_DAILY_REMINDER_MINUTE,
+            lead_min: 0,
+            snooze_min: 10,
+            balloon: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -485,6 +597,7 @@ pub struct AppConfig {
     pub desktop: DesktopConfig,
     pub boxes: Vec<BoxConfig>,
     pub clipboard: ClipboardConfig,
+    pub reminder: ReminderConfig,
     pub general: GeneralConfig,
 }
 
@@ -496,6 +609,7 @@ impl Default for AppConfig {
             desktop: DesktopConfig::default(),
             boxes: Vec::new(),
             clipboard: ClipboardConfig::default(),
+            reminder: ReminderConfig::default(),
             general: GeneralConfig::default(),
         }
     }
@@ -695,11 +809,13 @@ sort = "name"
                     id: "t1".into(),
                     text: "买牛奶".into(),
                     done: false,
+                    ..TodoItem::default()
                 },
                 TodoItem {
                     id: "t2".into(),
                     text: "写周报".into(),
                     done: true,
+                    ..TodoItem::default()
                 },
             ],
             todo_sort: TodoSort::Pending,
@@ -727,6 +843,7 @@ sort = "name"
                 id: "t3".into(),
                 text: "回邮件".into(),
                 done: false,
+                ..TodoItem::default()
             }],
             todo_sort: TodoSort::Name,
             view: BoxView::Icon,
@@ -800,6 +917,71 @@ done = false
         assert!(!old.closed);
         assert!(old.members.is_empty());
         assert_eq!(old.todo_sort, TodoSort::Manual);
+    }
+
+    #[test]
+    fn legacy_todo_without_due_fields_gets_defaults() {
+        let text = r#"
+[[boxes]]
+id = "todo-old"
+name = "待办"
+kind = "todo"
+
+[[boxes.todos]]
+id = "t1"
+text = "旧条目"
+done = false
+"#;
+        let cfg: AppConfig = toml::from_str(text).unwrap();
+        let t = &cfg.boxes[0].todos[0];
+        assert_eq!(t.text, "旧条目");
+        assert_eq!(t.due_at, None);
+        assert!(!t.all_day);
+        assert_eq!(t.local_date, None);
+        assert_eq!(t.repeat, RepeatRule::Once);
+        assert_eq!(t.interval_min, 0);
+        assert_eq!(t.interval_minutes(), MIN_INTERVAL_MIN);
+        assert_eq!(t.interval_base, IntervalBase::DueTime);
+        assert_eq!(t.lead_min, 0);
+        assert_eq!(t.snooze_until, None);
+        assert_eq!(t.last_fired, None);
+    }
+
+    #[test]
+    fn todo_due_fields_roundtrip() {
+        let mut cfg = AppConfig::default();
+        cfg.boxes.push(BoxConfig {
+            id: "todo".into(),
+            name: "巡检".into(),
+            kind: BoxKind::Todo,
+            todos: vec![TodoItem {
+                id: "t1".into(),
+                text: "巡检".into(),
+                due_at: Some(1_718_000_000),
+                local_date: Some(19_813),
+                local_minute: 540,
+                repeat: RepeatRule::Interval,
+                interval_min: 120,
+                interval_base: IntervalBase::CompletionTime,
+                lead_min: 5,
+                snooze_until: Some(1_718_000_600),
+                last_fired: Some(1_717_999_000),
+                ..TodoItem::default()
+            }],
+            ..BoxConfig::default()
+        });
+        let text = toml::to_string(&cfg).unwrap();
+        let back: AppConfig = toml::from_str(&text).unwrap();
+        let t = &back.boxes[0].todos[0];
+        assert_eq!(t.due_at, Some(1_718_000_000));
+        assert_eq!(t.local_date, Some(19_813));
+        assert_eq!(t.local_minute, 540);
+        assert_eq!(t.repeat, RepeatRule::Interval);
+        assert_eq!(t.interval_min, 120);
+        assert_eq!(t.interval_base, IntervalBase::CompletionTime);
+        assert_eq!(t.lead_min, 5);
+        assert_eq!(t.snooze_until, Some(1_718_000_600));
+        assert_eq!(t.last_fired, Some(1_717_999_000));
     }
 
     #[test]

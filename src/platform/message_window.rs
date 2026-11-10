@@ -10,18 +10,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN,
 };
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD,
-    NIM_DELETE, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
+    Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP,
+    NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetIconInfo, GetMessageW, LoadIconW, LoadImageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, HICON, ICONINFO, IDI_APPLICATION, IMAGE_ICON,
-    LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
-    WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DRAWITEM,
-    WM_HOTKEY, WM_INITMENUPOPUP, WM_LBUTTONUP, WM_MEASUREITEM, WM_MENUCHAR, WM_NULL, WM_RBUTTONUP,
-    WM_SETTINGCHANGE, WNDCLASSW, WS_POPUP,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer,
+    TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW, HICON, ICONINFO, IDI_APPLICATION,
+    IMAGE_ICON, LR_LOADFROMFILE, MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WM_APP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_DESTROY, WM_DISPLAYCHANGE,
+    WM_DRAWITEM, WM_HOTKEY, WM_INITMENUPOPUP, WM_LBUTTONUP, WM_MEASUREITEM, WM_MENUCHAR, WM_NULL,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_POPUP,
 };
 
 use crate::events::{BgEvent, EventSink, TrayCommand};
@@ -29,6 +29,16 @@ use crate::events::{BgEvent, EventSink, TrayCommand};
 pub const WM_APP_TRAY: u32 = WM_APP + 1;
 pub const WM_APP_ACTIVATE: u32 = WM_APP + 2;
 pub const WM_APP_RELOAD_HOTKEY: u32 = WM_APP + 3;
+/// 重新装载到期提醒定时器（UI 线程刷新调度快照后投递）。
+/// 注意避开 `shell_menu` 已占用的 `WM_APP + 4/5`。
+pub const WM_APP_REFRESH_TIMER: u32 = WM_APP + 16;
+
+/// 到期提醒定时器 id。
+const TIMER_REMINDER: usize = 1;
+/// 电源状态变化（`WM_POWERBROADCAST`）。
+const WM_POWERBROADCAST: u32 = 0x0218;
+const PBT_APMRESUMESUSPEND: usize = 0x0007;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 
 const HOTKEY_ID: i32 = 1;
 const ID_SHOW_CLIPBOARD: usize = 1001;
@@ -41,8 +51,15 @@ const ID_AUTO_GROUP: usize = 1007;
 const ID_RESTORE_AUTO: usize = 1008;
 const ID_ENABLE_BOARD: usize = 1009;
 
+/// 气泡被用户点击（`WM_USER + 5`，避开 `WM_APP_TRAY` 的鼠标消息区间）。
+const NIN_BALLOONUSERCLICK: u32 = 0x0405;
+
 static OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(true);
 static PAUSED: AtomicBool = AtomicBool::new(false);
+/// 最近一次到期气泡对应的盒子，供点击回跳。
+static LAST_BALLOON_BOX: Mutex<Option<String>> = Mutex::new(None);
+/// 首次装载定时器时先跑一个短周期，相当于启动时补一次到期提醒。
+static REMINDER_TIMER_FIRST: AtomicBool = AtomicBool::new(true);
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct HotkeySpec {
@@ -232,6 +249,7 @@ fn run_message_loop(_sink: EventSink, hotkey: Option<HotkeySpec>) {
 
         add_tray(hwnd);
         apply_hotkey(hotkey);
+        arm_reminder_timer(hwnd);
         let _ = windows::Win32::System::DataExchange::AddClipboardFormatListener(hwnd);
 
         let mut msg = MSG::default();
@@ -375,6 +393,45 @@ fn add_tray(hwnd: HWND) {
     }
 }
 
+/// 弹一次托盘气泡（`NIM_MODIFY + NIF_INFO`）。
+///
+/// 返回 false 表示气泡通道不可用（托盘未注册/系统关闭通知），调用方可回退到盒内红点。
+/// 气泡由 explorer 绘制，不抢焦点，也不受叠加层 `WS_EX_NOACTIVATE` 影响。
+pub fn notify_due(title: &str, body: &str, box_id: &str) -> bool {
+    let Some(hwnd) = hwnd() else {
+        return false;
+    };
+    if let Ok(mut guard) = LAST_BALLOON_BOX.lock() {
+        *guard = Some(box_id.to_string());
+    }
+    let nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_INFO,
+        szInfoTitle: wide_fixed(title),
+        szInfo: wide_fixed(body),
+        dwInfoFlags: NIIF_INFO,
+        ..Default::default()
+    };
+    // SAFETY: 托盘图标由本进程注册，`hwnd` 仍有效；Shell 调用线程无关。
+    let ok = unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) }.as_bool();
+    if ok {
+        log::info!("已通过托盘气泡提醒：{title} / {body}");
+    } else {
+        log::warn!("托盘气泡发送失败: {}", windows::core::Error::from_thread());
+    }
+    ok
+}
+
+fn wide_fixed<const N: usize>(text: &str) -> [u16; N] {
+    let mut buf = [0u16; N];
+    for (slot, unit) in buf.iter_mut().zip(text.encode_utf16()) {
+        *slot = unit;
+    }
+    buf
+}
+
 fn remove_tray(hwnd: HWND) {
     // SAFETY: 删除托盘图标。
     unsafe {
@@ -417,6 +474,50 @@ fn apply_hotkey(hotkey: Option<HotkeySpec>) {
         if let Some(ctx) = guard.as_mut() {
             ctx.hotkey = hotkey;
         }
+    }
+}
+
+/// 装载/重装到期提醒定时器（粒度由调度器按是否存在短周期任务决定）。
+fn arm_reminder_timer(hwnd: HWND) {
+    let interval = if REMINDER_TIMER_FIRST.swap(false, Ordering::Relaxed) {
+        2_000
+    } else {
+        crate::reminder::scheduler::tick_interval_ms()
+    };
+    // SAFETY: 句柄属于本线程创建的隐藏窗口，随窗口销毁自动回收。
+    unsafe {
+        let _ = SetTimer(Some(hwnd), TIMER_REMINDER, interval, None);
+    }
+}
+
+/// UI 线程请求按新的粒度重装定时器（快照变化后调用）。
+pub fn refresh_reminder_timer() {
+    let Some(hwnd) = hwnd() else {
+        return;
+    };
+    // SAFETY: 只向消息窗口投递命令，定时器本身仍在消息线程上操作。
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_APP_REFRESH_TIMER, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// 扫描一次到期提醒并把结果交给 UI 线程（展示与周期推进都在 UI 线程完成）。
+fn run_reminder_scan() {
+    let now = crate::reminder::scheduler::now_secs();
+    // 首次 tick 或时钟跳变（睡眠/改表）时同样走这次扫描，等价于「启动补提醒」。
+    let _ = crate::reminder::scheduler::note_tick(now);
+    let due = crate::reminder::scheduler::scan(now);
+    if due.is_empty() {
+        return;
+    }
+    log::info!(
+        "到期提醒：{} 项（最近：{} · {}）",
+        due.len(),
+        due[0].box_name,
+        due[0].text
+    );
+    if let Some(sink) = SINK.lock().ok().and_then(|g| g.clone()) {
+        sink.emit(BgEvent::RemindersDue(due));
     }
 }
 
@@ -502,6 +603,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             } else if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                 show_tray_menu(hwnd);
+            } else if event == NIN_BALLOONUSERCLICK {
+                // 点击气泡：唤出气泡对应的待办盒（叠加层被隐藏时同样恢复）。
+                let box_id = LAST_BALLOON_BOX.lock().ok().and_then(|g| g.clone());
+                if let (Some(sink), Some(box_id)) =
+                    (SINK.lock().ok().and_then(|g| g.clone()), box_id)
+                {
+                    sink.emit(BgEvent::ReminderActivated(box_id));
+                }
             }
             LRESULT(0)
         }
@@ -534,6 +643,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_RELOAD_HOTKEY => {
             let spec = NEXT_HOTKEY.lock().ok().and_then(|mut g| g.take()).flatten();
             apply_hotkey(spec);
+            LRESULT(0)
+        }
+        WM_APP_REFRESH_TIMER => {
+            arm_reminder_timer(hwnd);
+            LRESULT(0)
+        }
+        WM_TIMER if wparam.0 == TIMER_REMINDER => {
+            run_reminder_scan();
+            LRESULT(0)
+        }
+        WM_POWERBROADCAST => {
+            // 睡眠/休眠恢复后立刻补一次扫描，不等下一个定时器周期。
+            if wparam.0 == PBT_APMRESUMEAUTOMATIC || wparam.0 == PBT_APMRESUMESUSPEND {
+                log::info!("系统从睡眠/休眠恢复，立即补扫到期提醒");
+                run_reminder_scan();
+            }
             LRESULT(0)
         }
         crate::platform::shell_menu::WM_APP_SHELL_MENU => {

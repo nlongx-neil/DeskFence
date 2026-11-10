@@ -13,6 +13,7 @@ pub mod migration;
 pub mod model;
 pub mod platform;
 pub mod preview;
+pub mod reminder;
 pub mod startup;
 pub mod ui;
 pub mod util;

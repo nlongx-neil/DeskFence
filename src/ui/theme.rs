@@ -67,6 +67,18 @@ pub fn apply_inline_edit_visuals(ui: &mut egui::Ui) {
     v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
 }
 
+/// 弹窗内的文本输入框：光标与选中色跟随主题，深色下白字、浅色下深字都清晰。
+pub fn apply_popup_edit_visuals(ui: &mut egui::Ui, pal: &Palette) {
+    let v = ui.visuals_mut();
+    v.text_cursor.stroke = Stroke::new(2.0, pal.text);
+    v.selection.bg_fill = if pal.dark {
+        Color32::from_rgb(38, 92, 176)
+    } else {
+        pal.selection
+    };
+    v.selection.stroke = Stroke::new(1.0, pal.text);
+}
+
 /// 弹窗统一圆角（窗口/浮层）；菜单略小一档，保持层级差异但不割裂。
 pub const POPUP_RADIUS: u8 = 12;
 pub const MENU_RADIUS: u8 = 10;

@@ -1,5 +1,5 @@
 [package]
-name = "deskkeeper"
+name = "DeskFence"
 version = "0.1.0"
 edition = "2021"
 description = "DeskKeeper - 纯 Rust 桌面整理工具与剪贴板历史"
@@ -24,6 +24,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_SystemServices",
+    "Win32_System_Time",
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_UI_Input_KeyboardAndMouse",

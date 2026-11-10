@@ -16,7 +16,7 @@ use crate::clipboard::service::{paste_record, ClipService};
 use crate::clipboard::store::{record_matches, ClipRecord, Store, StoreCmd};
 use crate::config::{
     AppConfig, BoxConfig, BoxKind, BoxView, ClipFilter, ConfigSaver, DesktopSlot, FileFilter,
-    GroupTarget, OccupiedDropMode, SortMode, TodoSort,
+    GroupTarget, OccupiedDropMode, RepeatRule, SortMode, TodoSort,
 };
 use crate::events::{BgEvent, DesktopMenuAction, EventSink, ShellMenuAction, TrayCommand};
 use crate::fileops::{self, MoveRecord, UndoStack};
@@ -28,6 +28,7 @@ use crate::platform::message_window::{self, HotkeySpec};
 use crate::platform::single_instance::SingleInstance;
 use crate::platform::{autostart, desktop, key_hook, shell};
 use crate::preview::{self, PreviewData};
+use crate::reminder::time::LocalZone;
 use crate::ui::{self, fit_text, theme, TextureCache};
 use crate::util;
 use crate::watcher::{self, WatchSpec, WatcherHandle};
@@ -38,6 +39,8 @@ const RADIUS: u8 = 14;
 const MIN_W: f32 = 220.0;
 const MIN_H: f32 = 130.0;
 const BTN: f32 = 22.0;
+/// 到期提醒的强调色（红点 / 逾期文案），深浅主题共用。
+const DUE_DANGER: Color32 = Color32::from_rgb(224, 88, 76);
 /// 上一次同步给键盘钩子的预览接管状态，仅用于在状态翻转时打一条判定日志。
 static PREVIEW_ARMED_LOGGED: AtomicBool = AtomicBool::new(false);
 /// 盒子缩放命中带宽度（逻辑点，随所属屏 DPI 缩放）：三边与四角都用它。
@@ -155,6 +158,30 @@ enum Modal {
         color: [u8; 3],
         alpha: u8,
     },
+    /// 设置/修改某条待办的到期提醒。
+    TodoDue(Box<DueEdit>),
+}
+
+/// 「到期提醒」弹窗的编辑态。
+struct DueEdit {
+    box_idx: usize,
+    todo_id: String,
+    /// 单行手输（如 `明天 09:00`），与下面的日期/时刻两个框互相回填。
+    quick: String,
+    /// 单行框最近一次提交失败的原因，显示在框下方。
+    quick_error: Option<String>,
+    /// 用户最后编辑的是单行框；保存时以它为准。
+    quick_dirty: bool,
+    /// 打开弹窗后首帧把键盘焦点放到单行框。
+    focus: bool,
+    /// 本地日期输入（`YYYY-MM-DD`）。
+    date: String,
+    /// 本地时刻输入（`HH:MM`），`all_day` 时忽略。
+    time: String,
+    all_day: bool,
+    repeat: RepeatRule,
+    interval_min: u32,
+    error: Option<String>,
 }
 
 /// 需要二次确认的盒子操作。关闭（隐藏）不需要确认，这里只有不可撤销的删除。
@@ -644,6 +671,8 @@ impl DeskApp {
         let store = Store::spawn(sink.clone());
         let service = ClipService::spawn(sink.clone(), store.clone(), clip.clone(), paused.clone());
 
+        // 消息窗口的到期提醒定时器依赖调度快照，必须在 spawn 之前装载。
+        crate::reminder::scheduler::sync_from_config(&cfg);
         message_window::spawn(sink.clone(), HotkeySpec::from_config(&cfg.clipboard.hotkey));
         message_window::set_paused(!cfg.clipboard.enabled);
         message_window::set_overlay_visible(cfg.general.show_overlay);
@@ -796,9 +825,166 @@ impl DeskApp {
     }
 
     fn persist(&self) {
+        crate::reminder::scheduler::sync_from_config(&self.cfg);
         if !self.saver.request(&self.cfg) {
             log::warn!("配置保存通道已关闭，本次修改可能未落盘");
         }
+    }
+
+    /// 打开「到期提醒」编辑弹窗，预填当前值；无到期时间时预填 1 小时后。
+    fn open_due_editor(&mut self, idx: usize, todo_id: &str) {
+        let now = crate::reminder::scheduler::now_secs();
+        let zone = crate::reminder::time::SystemZone;
+        let Some(t) = self
+            .cfg
+            .boxes
+            .get(idx)
+            .and_then(|b| b.todos.iter().find(|t| t.id == todo_id))
+        else {
+            return;
+        };
+        let local = t
+            .due_at
+            .map(|ts| zone.utc_to_local(ts))
+            .unwrap_or_else(|| zone.utc_to_local(now + 3_600));
+        let (year, month, day) = crate::reminder::time::civil_from_days(local.day);
+        let date = format!("{year:04}-{month:02}-{day:02}");
+        let quick = if t.all_day {
+            date.clone()
+        } else {
+            format!("{date} {:02}:{:02}", local.minute / 60, local.minute % 60)
+        };
+        self.modal = Modal::TodoDue(Box::new(DueEdit {
+            box_idx: idx,
+            todo_id: todo_id.to_string(),
+            quick,
+            quick_error: None,
+            quick_dirty: false,
+            focus: true,
+            date,
+            time: format!("{:02}:{:02}", local.minute / 60, local.minute % 60),
+            all_day: t.all_day,
+            repeat: t.repeat,
+            interval_min: t.interval_min.max(crate::config::MIN_INTERVAL_MIN),
+            error: None,
+        }));
+        // 叠加层默认 `WS_EX_NOACTIVATE`，不临时放开就收不到键入（含 IME 与粘贴）。
+        self.begin_text_input();
+    }
+
+    /// 写回到期设置（`local` 已由弹窗校验）。
+    fn apply_due_edit(&mut self, edit: &DueEdit, local: crate::reminder::time::LocalTime) {
+        let zone = crate::reminder::time::SystemZone;
+        let lead_min = crate::reminder::scheduler::settings().lead_min;
+        let Some(t) = self
+            .cfg
+            .boxes
+            .get_mut(edit.box_idx)
+            .and_then(|b| b.todos.iter_mut().find(|t| t.id == edit.todo_id))
+        else {
+            return;
+        };
+        crate::reminder::set_due_local(t, local, &zone);
+        t.all_day = edit.all_day;
+        t.repeat = edit.repeat;
+        t.interval_min = edit.interval_min;
+        t.lead_min = lead_min;
+        // 改期后重新开始：清掉上一轮的提醒/延后状态。
+        t.last_fired = None;
+        t.snooze_until = None;
+        self.toast_msg("已设置到期时间");
+        self.persist();
+    }
+
+    fn clear_due(&mut self, idx: usize, todo_id: &str) {
+        let Some(t) = self
+            .cfg
+            .boxes
+            .get_mut(idx)
+            .and_then(|b| b.todos.iter_mut().find(|t| t.id == todo_id))
+        else {
+            return;
+        };
+        t.due_at = None;
+        t.local_date = None;
+        t.all_day = false;
+        t.repeat = RepeatRule::Once;
+        t.snooze_until = None;
+        t.last_fired = None;
+        self.toast_msg("已清除到期时间");
+        self.persist();
+    }
+
+    /// 稍后提醒：只推迟触发，不改到期点与周期相位。
+    fn snooze_todo(&mut self, idx: usize, todo_id: &str) {
+        let minutes = crate::reminder::scheduler::settings().snooze_min.max(1) as i64;
+        let now = crate::reminder::scheduler::now_secs();
+        let Some(t) = self
+            .cfg
+            .boxes
+            .get_mut(idx)
+            .and_then(|b| b.todos.iter_mut().find(|t| t.id == todo_id))
+        else {
+            return;
+        };
+        t.snooze_until = Some(now + minutes * 60);
+        // 清掉本次的已提醒标记，窗口结束后才会真的再响一次；`due_at` 与周期相位不变。
+        t.last_fired = None;
+        self.toast_msg(format!("{minutes} 分钟内不再提醒"));
+        self.persist();
+    }
+
+    /// 处理调度器的到期扫描结果：推进周期 + 合并成一条托盘气泡。
+    fn on_reminders_due(&mut self, items: Vec<crate::reminder::scheduler::DueItem>) {
+        if items.is_empty() {
+            return;
+        }
+        let now = crate::reminder::scheduler::now_secs();
+        let zone = crate::reminder::time::SystemZone;
+        let mut fired: Vec<(String, String)> = Vec::new();
+        for item in &items {
+            let Some(b) = self.cfg.boxes.iter_mut().find(|b| b.id == item.box_id) else {
+                continue;
+            };
+            let Some(t) = b.todos.iter_mut().find(|t| t.id == item.todo_id) else {
+                continue;
+            };
+            if t.done {
+                continue;
+            }
+            crate::reminder::mark_fired(t, item.due_at, now, &zone);
+            fired.push((
+                item.box_id.clone(),
+                format!("{} · {}", item.box_name, item.text),
+            ));
+        }
+        if fired.is_empty() {
+            return;
+        }
+        let title = if fired.len() == 1 {
+            "待办到期".to_string()
+        } else {
+            format!("{} 项待办到期", fired.len())
+        };
+        // 多条同时到期只弹一个气泡：最多列 3 条，其余合并成总数。
+        let lines: Vec<&str> = fired
+            .iter()
+            .take(3)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        let body = if fired.len() > 3 {
+            format!("{}\n…等 {} 项", lines.join("\n"), fired.len())
+        } else {
+            lines.join("\n")
+        };
+        let box_id = fired[0].0.clone();
+        if crate::reminder::scheduler::settings().balloon
+            && !crate::platform::message_window::notify_due(&title, &body, &box_id)
+        {
+            log::warn!("到期气泡不可用，保留盒内到期提示：{body}");
+        }
+        self.persist();
+        self.ctx.request_repaint();
     }
 
     /// 重新枚举显示器（按左上到右下排序，保证图标填充顺序稳定）。
@@ -1293,6 +1479,19 @@ impl DeskApp {
                 BgEvent::HistoryChanged => {
                     if self.box_index_by_kind(BoxKind::Clipboard).is_some() {
                         self.query_clip_box();
+                    }
+                }
+                BgEvent::RemindersDue(items) => self.on_reminders_due(items),
+                BgEvent::ReminderActivated(box_id) => {
+                    if let Some(idx) = self.cfg.boxes.iter().position(|b| b.id == box_id) {
+                        self.cfg.boxes[idx].closed = false;
+                        if !self.overlay_visible {
+                            self.set_overlay_visible(true);
+                        }
+                        self.zorder_pending = true;
+                        self.persist();
+                        self.ctx.request_repaint();
+                        log::info!("点击到期气泡：打开盒子「{}」", self.cfg.boxes[idx].name);
                     }
                 }
                 BgEvent::FileMoved { record, error } => {
@@ -2959,6 +3158,7 @@ impl DeskApp {
                             id: util::gen_id("todo-"),
                             text,
                             done: false,
+                            ..Default::default()
                         });
                         self.persist();
                     }
@@ -5184,7 +5384,25 @@ impl DeskApp {
         let color_rect = Rect::from_center_size(egui::pos2(bx, by), Vec2::splat(btn));
         bx -= btn + 4.0 * k;
         let collapse_rect = Rect::from_center_size(egui::pos2(bx, by), Vec2::splat(btn));
-        let title_w = (collapse_rect.left() - rect.left() - pad - 8.0 * k).max(40.0 * k);
+        let now_ts = crate::reminder::scheduler::now_secs();
+        let zone = crate::reminder::time::SystemZone;
+        // 标题栏到期提示：仅统计「已到期且未完成」，数字跟着条目自增自减。
+        let daily_minute = crate::reminder::scheduler::settings().daily_minute;
+        let due_count = box_cfg
+            .todos
+            .iter()
+            .filter(|t| crate::reminder::is_overdue(t, now_ts, &zone, daily_minute))
+            .count();
+        let due_badge = (due_count > 0).then(|| format!("● {due_count}"));
+        let due_badge_w = due_badge.as_ref().map_or(0.0, |text| {
+            ui.painter()
+                .layout_no_wrap(text.clone(), FontId::proportional(11.0 * k), DUE_DANGER)
+                .size()
+                .x
+                + 8.0 * k
+        });
+        let title_w =
+            (collapse_rect.left() - rect.left() - pad - 8.0 * k - due_badge_w).max(40.0 * k);
         let title_left = rect.left() + pad;
         let title_rect = Rect::from_min_max(
             egui::pos2(title_left, header.top() + 3.0 * k),
@@ -5204,6 +5422,15 @@ impl DeskApp {
             // 名称被截断时，悬停标题栏可看到完整名称。
             ui.interact(title_rect, Id::unique(("box-title", idx)), Sense::hover())
                 .on_hover_text(box_cfg.name.clone());
+        }
+        if let Some(text) = &due_badge {
+            ui.painter().text(
+                egui::pos2(collapse_rect.left() - 6.0 * k, by),
+                Align2::RIGHT_CENTER,
+                text,
+                FontId::proportional(11.0 * k),
+                DUE_DANGER,
+            );
         }
         if glyph_button(ui, close_rect, ("box-close", idx), "×", pal.text_dim, &pal) {
             // 关闭 ≠ 删除：× 只隐藏盒子，内容/几何/样式全部保留。
@@ -6610,6 +6837,11 @@ impl DeskApp {
         if list.height() < 20.0 * k {
             return;
         }
+        // 相对时间文案需要随时间自己走，静态画面下也要定期重绘（30s 粒度足够）。
+        if box_cfg.todos.iter().any(|t| !t.done && t.due_at.is_some()) {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(30));
+        }
         let mut todos = box_cfg.todos.clone();
         match sort {
             TodoSort::Manual => {}
@@ -6641,6 +6873,10 @@ impl DeskApp {
         let scroll = self.boxes[idx].scroll.min(max_scroll);
         let painter = ui.painter().with_clip_rect(list);
         let font = FontId::proportional(12.5 * k);
+        let now_ts = crate::reminder::scheduler::now_secs();
+        let zone = crate::reminder::time::SystemZone;
+        let daily_minute = crate::reminder::scheduler::settings().daily_minute;
+        let meta_font = FontId::proportional(10.5 * k);
         for (i, t) in todos.iter().enumerate() {
             let top = list.top() + i as f32 * (row_h + row_gap) - scroll;
             if top + row_h < list.top() || top > list.bottom() {
@@ -6704,9 +6940,42 @@ impl DeskApp {
                 egui::pos2(row.right() - 14.0 * k, row.center().y),
                 Vec2::splat(18.0 * k),
             );
+            // 行尾信息：最近到期点的相对时间 + 周期角标；已完成或无到期时间时不占位。
+            let due_meta = t.due_at.filter(|_| !t.done).map(|_| {
+                let occ =
+                    crate::reminder::display_due(t, now_ts, &zone, daily_minute).unwrap_or(now_ts);
+                (
+                    occ,
+                    crate::reminder::relative_label(now_ts, occ),
+                    crate::reminder::repeat_badge(t),
+                )
+            });
+            let mut meta_w = 0.0;
+            let overdue =
+                due_meta.is_some() && crate::reminder::is_overdue(t, now_ts, &zone, daily_minute);
+            if let Some((_occ, label, badge)) = &due_meta {
+                meta_w = painter
+                    .layout_no_wrap(label.clone(), meta_font.clone(), pal.text_dim)
+                    .size()
+                    .x
+                    + 6.0 * k
+                    + if overdue { 9.0 * k } else { 0.0 };
+                if let Some(badge) = badge {
+                    meta_w += painter
+                        .layout_no_wrap(badge.clone(), meta_font.clone(), pal.text_dim)
+                        .size()
+                        .x
+                        + 4.0 * k;
+                }
+                // 极窄盒子下宁可截断标题，也不让行尾信息压到复选框上。
+                meta_w = meta_w.min(row.width() * 0.55);
+            }
             let text_area = Rect::from_min_max(
                 egui::pos2(row.left() + 28.0 * k, row.top()),
-                egui::pos2(del.left() - 4.0 * k, row.bottom()),
+                egui::pos2(
+                    (del.left() - 4.0 * k - meta_w).max(row.left() + 40.0 * k),
+                    row.bottom(),
+                ),
             );
             let editing = self
                 .todo_edit
@@ -6815,6 +7084,22 @@ impl DeskApp {
                             actions.push(UiAction::TodoMoveTop(idx, tid.clone()));
                             ui.close();
                         }
+                        if ui.button("设置到期时间…").clicked() {
+                            self.open_due_editor(idx, &tid);
+                            ui.close();
+                        }
+                        if !done && t.due_at.is_some() {
+                            let snooze_min =
+                                crate::reminder::scheduler::settings().snooze_min.max(1);
+                            if ui.button(format!("稍后提醒 {snooze_min} 分钟")).clicked() {
+                                self.snooze_todo(idx, &tid);
+                                ui.close();
+                            }
+                        }
+                        if t.due_at.is_some() && ui.button("清除到期时间").clicked() {
+                            self.clear_due(idx, &tid);
+                            ui.close();
+                        }
                         if ui.button("删除").clicked() {
                             if self.todo_edit.as_ref().is_some_and(|e| e.id == tid) {
                                 self.todo_edit = None;
@@ -6824,6 +7109,36 @@ impl DeskApp {
                             ui.close();
                         }
                     });
+                }
+            }
+
+            if let Some((_occ, label, badge)) = &due_meta {
+                let color = if overdue { DUE_DANGER } else { pal.text_dim };
+                let mut right = del.left() - 8.0 * k;
+                if let Some(badge) = badge {
+                    let galley =
+                        painter.layout_no_wrap(badge.clone(), meta_font.clone(), pal.text_dim);
+                    right -= galley.size().x;
+                    painter.galley(
+                        egui::pos2(right, row.center().y - galley.size().y * 0.5),
+                        galley,
+                        pal.text_dim,
+                    );
+                    right -= 4.0 * k;
+                }
+                let galley = painter.layout_no_wrap(label.clone(), meta_font.clone(), color);
+                right -= galley.size().x;
+                painter.galley(
+                    egui::pos2(right, row.center().y - galley.size().y * 0.5),
+                    galley,
+                    color,
+                );
+                if overdue {
+                    painter.circle_filled(
+                        egui::pos2(right - 5.0 * k, row.center().y),
+                        2.4 * k,
+                        DUE_DANGER,
+                    );
                 }
             }
 
@@ -8031,6 +8346,323 @@ impl DeskApp {
                 }
                 if !apply && !cancel {
                     self.modal = Modal::Color { idx, color, alpha };
+                }
+            }
+            Modal::TodoDue(mut edit) => {
+                let pal = self.pal;
+                let dark = self.dark;
+                let now = crate::reminder::scheduler::now_secs();
+                let zone = crate::reminder::time::SystemZone;
+                let today = zone.utc_to_local(now);
+                let default_minute = crate::reminder::scheduler::settings().daily_minute;
+                let quick_id = Id::unique("todo-due-quick");
+                let date_id = Id::unique("todo-due-date");
+                let time_id = Id::unique("todo-due-time");
+                let mut save = false;
+                let mut clear = false;
+                let mut cancel = false;
+                let mut want_keyboard = false;
+                // 只在打开后的第一帧抢焦点；之后由用户点击决定。
+                let need_focus = edit.focus;
+                edit.focus = false;
+                theme::popup_window(Id::unique("modal-todo-due"), "到期提醒", &pal, dark).show(
+                    &ctx,
+                    |ui| {
+                        // 用「绘制前」的焦点：单行 TextEdit 收到回车会在同一帧放弃焦点。
+                        let focused_before = ui.ctx().memory(|m| m.focused());
+                        let typing = matches!(
+                            focused_before,
+                            Some(id) if id == quick_id || id == date_id || id == time_id
+                        );
+                        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        ui.label(theme::popup_title("到期提醒", &pal));
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        ui.label(theme::popup_body("快捷设置（相对当前时间）", &pal));
+                        ui.add_space(6.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let presets: [(&str, crate::reminder::time::LocalTime); 6] = [
+                                ("30 分钟后", zone.utc_to_local(now + 30 * 60)),
+                                ("1 小时后", zone.utc_to_local(now + 60 * 60)),
+                                ("3 小时后", zone.utc_to_local(now + 180 * 60)),
+                                (
+                                    "今天 18:00",
+                                    crate::reminder::time::LocalTime::new(today.day, 18 * 60),
+                                ),
+                                (
+                                    "明天 09:00",
+                                    crate::reminder::time::LocalTime::new(today.day + 1, 9 * 60),
+                                ),
+                                (
+                                    "下周一 09:00",
+                                    crate::reminder::next_weekday_local(now, 1, 9 * 60, &zone),
+                                ),
+                            ];
+                            for (label, local) in presets {
+                                if ui.button(label).clicked() {
+                                    let (year, month, day) =
+                                        crate::reminder::time::civil_from_days(local.day);
+                                    edit.date = format!("{year:04}-{month:02}-{day:02}");
+                                    edit.time = format!(
+                                        "{:02}:{:02}",
+                                        local.minute / 60,
+                                        local.minute % 60
+                                    );
+                                    edit.quick = format!("{} {}", edit.date, edit.time);
+                                    edit.quick_dirty = false;
+                                    edit.quick_error = None;
+                                    edit.all_day = false;
+                                    edit.error = None;
+                                }
+                            }
+                        });
+                        ui.add_space(10.0);
+                        ui.label(theme::popup_body("手动输入", &pal));
+                        ui.add_space(6.0);
+                        let quick_resp = ui
+                            .scope(|ui| {
+                                theme::apply_popup_edit_visuals(ui, &pal);
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut edit.quick)
+                                        .id(quick_id)
+                                        .desired_width(f32::INFINITY)
+                                        .margin(egui::vec2(8.0, 6.0))
+                                        .text_color(pal.text)
+                                        .hint_text("如 11-20 14:30、明天 09:00、下周一 9点"),
+                                )
+                            })
+                            .inner;
+                        if quick_resp.has_focus() {
+                            ui.painter().rect_stroke(
+                                quick_resp.rect.expand(1.0),
+                                egui::CornerRadius::same(9),
+                                Stroke::new(1.5, pal.accent),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        if quick_resp.clicked() && !quick_resp.has_focus() {
+                            want_keyboard = true;
+                            quick_resp.request_focus();
+                        }
+                        if need_focus {
+                            want_keyboard = true;
+                            quick_resp.request_focus();
+                        }
+                        if quick_resp.changed() {
+                            edit.quick_dirty = true;
+                            edit.quick_error = None;
+                            // 能解析就同步下面两个框；解析不了只提示、绝不改写用户输入。
+                            if let Ok(parsed) = crate::reminder::parse_due_text(
+                                &edit.quick,
+                                now,
+                                &zone,
+                                default_minute,
+                            ) {
+                                let (year, month, day) =
+                                    crate::reminder::time::civil_from_days(parsed.local.day);
+                                edit.date = format!("{year:04}-{month:02}-{day:02}");
+                                edit.time = format!(
+                                    "{:02}:{:02}",
+                                    parsed.local.minute / 60,
+                                    parsed.local.minute % 60
+                                );
+                                edit.all_day = !parsed.has_time;
+                                edit.error = None;
+                            }
+                        } else if quick_resp.lost_focus() && !enter {
+                            // 离开输入框时先校验一次：看不懂就给原因，输入原样保留。
+                            edit.quick_error = crate::reminder::parse_due_text(
+                                &edit.quick,
+                                now,
+                                &zone,
+                                default_minute,
+                            )
+                            .err();
+                        }
+
+                        ui.add_space(6.0);
+                        let mut date_changed = false;
+                        let mut time_changed = false;
+                        let mut all_day_changed = false;
+                        ui.horizontal(|ui| {
+                            ui.label(theme::popup_hint("或分开填写", &pal));
+                            let date_resp = ui
+                                .scope(|ui| {
+                                    theme::apply_popup_edit_visuals(ui, &pal);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut edit.date)
+                                            .id(date_id)
+                                            .desired_width(104.0)
+                                            .margin(egui::vec2(6.0, 4.0))
+                                            .text_color(pal.text)
+                                            .hint_text("YYYY-MM-DD"),
+                                    )
+                                })
+                                .inner;
+                            let time_resp = ui
+                                .scope(|ui| {
+                                    theme::apply_popup_edit_visuals(ui, &pal);
+                                    ui.add_enabled(
+                                        !edit.all_day,
+                                        egui::TextEdit::singleline(&mut edit.time)
+                                            .id(time_id)
+                                            .desired_width(62.0)
+                                            .margin(egui::vec2(6.0, 4.0))
+                                            .text_color(pal.text)
+                                            .hint_text("HH:MM"),
+                                    )
+                                })
+                                .inner;
+                            for resp in [&date_resp, &time_resp] {
+                                if resp.has_focus() {
+                                    ui.painter().rect_stroke(
+                                        resp.rect.expand(1.0),
+                                        egui::CornerRadius::same(9),
+                                        Stroke::new(1.5, pal.accent),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                }
+                                if resp.clicked() && !resp.has_focus() {
+                                    want_keyboard = true;
+                                    resp.request_focus();
+                                }
+                            }
+                            date_changed = date_resp.changed();
+                            time_changed = time_resp.changed();
+                            let all_day_resp = ui.checkbox(&mut edit.all_day, "只设日期");
+                            all_day_changed = all_day_resp.changed();
+                        });
+                        // 分开填写有改动时，用它们回填单行框（保持在同一条数据上改）。
+                        if date_changed || time_changed || all_day_changed {
+                            edit.quick_dirty = false;
+                            edit.quick_error = None;
+                            edit.error = None;
+                            edit.quick = if edit.all_day {
+                                edit.date.trim().to_string()
+                            } else {
+                                format!("{} {}", edit.date.trim(), edit.time.trim())
+                            };
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label("重复");
+                            egui::ComboBox::from_id_salt("todo-due-repeat")
+                                .selected_text(edit.repeat.label())
+                                .show_ui(ui, |ui| {
+                                    for rule in RepeatRule::ALL {
+                                        ui.selectable_value(&mut edit.repeat, rule, rule.label());
+                                    }
+                                });
+                        });
+                        if edit.repeat == RepeatRule::Interval {
+                            ui.horizontal_wrapped(|ui| {
+                                for minutes in crate::config::INTERVAL_PRESETS_MIN {
+                                    let label = if minutes.is_multiple_of(60) {
+                                        format!("每 {} 小时", minutes / 60)
+                                    } else {
+                                        format!("每 {minutes} 分钟")
+                                    };
+                                    if ui
+                                        .selectable_label(edit.interval_min == minutes, label)
+                                        .clicked()
+                                    {
+                                        edit.interval_min = minutes;
+                                    }
+                                }
+                                ui.add(
+                                    egui::DragValue::new(&mut edit.interval_min)
+                                        .range(crate::config::MIN_INTERVAL_MIN..=10_080)
+                                        .suffix(" 分钟"),
+                                );
+                            });
+                        }
+                        ui.add_space(4.0);
+                        ui.label(theme::popup_hint(
+                            "手输支持 2026-11-20 14:30 / 11-20 14:30 / 明天 09:00 / 下周一 9点 / 14:30；\
+                             只写日期时按每日提醒时刻提醒。",
+                            &pal,
+                        ));
+                        if let Some(err) = &edit.quick_error {
+                            ui.add_space(4.0);
+                            ui.colored_label(DUE_DANGER, err.clone());
+                        }
+                        if let Some(err) = &edit.error {
+                            ui.add_space(4.0);
+                            ui.colored_label(DUE_DANGER, err.clone());
+                        }
+                        if esc {
+                            cancel = true;
+                        } else if enter && typing {
+                            save = true;
+                        }
+                        ui.add_space(14.0);
+                        theme::popup_buttons(ui, |ui| {
+                            if theme::primary_button(ui, "保存", false, &pal).clicked() {
+                                save = true;
+                            }
+                            ui.add_space(8.0);
+                            if theme::ghost_button(ui, "清除", &pal).clicked() {
+                                clear = true;
+                            }
+                            ui.add_space(8.0);
+                            if theme::ghost_button(ui, "取消", &pal).clicked() {
+                                cancel = true;
+                            }
+                        });
+                    },
+                );
+                if want_keyboard {
+                    self.begin_text_input();
+                }
+                if cancel {
+                    self.end_text_input();
+                } else if save {
+                    // 单行框是最后编辑的字段就以它为准；否则按分开填写校验。
+                    let parsed = if edit.quick_dirty {
+                        match crate::reminder::parse_due_text(
+                            &edit.quick,
+                            now,
+                            &zone,
+                            default_minute,
+                        ) {
+                            Ok(parsed) => {
+                                edit.all_day = !parsed.has_time;
+                                Ok(parsed.local)
+                            }
+                            Err(msg) => Err(msg),
+                        }
+                    } else {
+                        crate::reminder::parse_local_input(&edit.date, &edit.time, edit.all_day)
+                            .ok_or_else(|| {
+                                "日期或时刻无效：日期用 YYYY-MM-DD，时刻用 HH:MM".to_string()
+                            })
+                    };
+                    match parsed {
+                        Ok(local) => {
+                            let local = if edit.all_day {
+                                crate::reminder::time::LocalTime::new(local.day, 0)
+                            } else {
+                                local
+                            };
+                            self.apply_due_edit(&edit, local);
+                            self.end_text_input();
+                        }
+                        Err(msg) => {
+                            if edit.quick_dirty {
+                                edit.quick_error = Some(msg);
+                            } else {
+                                edit.error = Some(msg);
+                            }
+                            self.modal = Modal::TodoDue(edit);
+                        }
+                    }
+                } else if clear {
+                    self.clear_due(edit.box_idx, &edit.todo_id);
+                    self.end_text_input();
+                } else if !cancel {
+                    self.modal = Modal::TodoDue(edit);
                 }
             }
         }
